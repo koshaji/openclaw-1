@@ -60,6 +60,7 @@ vi.mock("./clawhub.js", () => ({
     PACKAGE_NOT_FOUND: "package_not_found",
     VERSION_NOT_FOUND: "version_not_found",
     ARCHIVE_INTEGRITY_MISMATCH: "archive_integrity_mismatch",
+    CLAWHUB_RISK_ACKNOWLEDGEMENT_REQUIRED: "clawhub_risk_acknowledgement_required",
   },
   installPluginFromClawHub: (...args: unknown[]) => installPluginFromClawHubMock(...args),
 }));
@@ -1699,6 +1700,12 @@ describe("updateNpmInstalledPlugins", () => {
             installPath: "/tmp/demo",
           },
         },
+        allow: ["demo", "other"],
+        deny: ["blocked"],
+        slots: {
+          memory: "demo",
+          contextEngine: "demo",
+        },
       },
     } satisfies OpenClawConfig;
 
@@ -1719,6 +1726,12 @@ describe("updateNpmInstalledPlugins", () => {
       enabled: false,
       config: { preserved: true },
     });
+    expect(result.config.plugins?.allow).toEqual(["other"]);
+    expect(result.config.plugins?.deny).toEqual(["blocked"]);
+    expect(result.config.plugins?.slots).toEqual({
+      memory: "memory-core",
+      contextEngine: "legacy",
+    });
     expect(result.config.plugins?.installs?.demo).toEqual(config.plugins.installs.demo);
     expect(result.outcomes).toEqual([
       {
@@ -1729,60 +1742,65 @@ describe("updateNpmInstalledPlugins", () => {
     ]);
   });
 
-  it("clears stale plugin policy and slot references when disabling failed updates", async () => {
-    const warn = vi.fn();
-    installPluginFromNpmSpecMock.mockResolvedValue({
+  it("keeps an existing ClawHub plugin enabled when a risky update is not acknowledged", async () => {
+    installPluginFromClawHubMock.mockResolvedValue({
       ok: false,
-      error: "security scan blocked install",
+      code: "clawhub_risk_acknowledgement_required",
+      error:
+        'ClawHub release "demo@1.2.4" was not installed because the risk was not acknowledged. Review the warning above; to continue anyway, rerun with --acknowledge-clawhub-risk.',
+      warning:
+        "╭─ REVIEW REQUIRED - ClawHub flagged this release for security review ─╮\n│ • Finding: suspicious payload strings │\n╰───────────────────────────────────────────────────────────────────────╯",
     });
-    const config = {
-      plugins: {
-        allow: ["demo", "keep"],
-        deny: ["demo", "blocked"],
-        slots: {
-          memory: "demo",
-          contextEngine: "demo",
-        },
-        entries: {
-          demo: {
-            enabled: true,
-          },
-        },
-        installs: {
-          demo: {
-            source: "npm" as const,
-            spec: "@acme/demo",
-            installPath: "/tmp/demo",
-          },
+    const installPath = createInstalledPackageDir({
+      name: "demo",
+      version: "1.2.3",
+    });
+    const config = createClawHubInstallConfig({
+      pluginId: "demo",
+      installPath,
+      clawhubUrl: "https://clawhub.ai",
+      clawhubPackage: "demo",
+      clawhubFamily: "code-plugin",
+      clawhubChannel: "official",
+    });
+    config.plugins = {
+      ...config.plugins,
+      entries: {
+        demo: {
+          enabled: true,
+          config: { preserved: true },
         },
       },
-    } satisfies OpenClawConfig;
+      allow: ["demo"],
+      slots: {
+        memory: "demo",
+      },
+    };
 
     const result = await updateNpmInstalledPlugins({
       config,
+      pluginIds: ["demo"],
       disableOnFailure: true,
-      logger: { warn },
     });
 
-    const message =
-      'Disabled "demo" after plugin update failure; OpenClaw will continue without it. Failed to update demo: security scan blocked install';
-    expect(warn).toHaveBeenCalledWith(message);
-    expect(result.changed).toBe(true);
+    expect(clawHubInstallCall()?.spec).toBe("clawhub:demo");
+    expect(result.changed).toBe(false);
+    expect(result.config).toBe(config);
     expect(result.config.plugins?.entries?.demo).toEqual({
-      enabled: false,
+      enabled: true,
+      config: { preserved: true },
     });
-    expect(result.config.plugins?.installs?.demo).toEqual(config.plugins.installs.demo);
-    expect(result.config.plugins?.allow).toEqual(["keep"]);
-    expect(result.config.plugins?.deny).toEqual(["blocked"]);
-    expect(result.config.plugins?.slots).toEqual({
-      memory: "memory-core",
-      contextEngine: "legacy",
-    });
+    expect(result.config.plugins?.allow).toEqual(["demo"]);
+    expect(result.config.plugins?.slots?.memory).toBe("demo");
     expect(result.outcomes).toEqual([
       {
         pluginId: "demo",
         status: "skipped",
-        message,
+        currentVersion: "1.2.3",
+        warning:
+          "╭─ REVIEW REQUIRED - ClawHub flagged this release for security review ─╮\n│ • Finding: suspicious payload strings │\n╰───────────────────────────────────────────────────────────────────────╯",
+        message:
+          'Skipped demo ClawHub update: ClawHub release "demo@1.2.4" was not installed because the risk was not acknowledged. Review the warning above; to continue anyway, rerun with --acknowledge-clawhub-risk. Existing installed plugin left unchanged.',
       },
     ]);
   });
@@ -2455,6 +2473,57 @@ describe("updateNpmInstalledPlugins", () => {
     });
   });
 
+  it("forwards ClawHub risk acknowledgement inputs without dry-run prompts", async () => {
+    const onClawHubRisk = vi.fn(async () => true);
+    const config = createClawHubInstallConfig({
+      pluginId: "demo",
+      installPath: "/tmp/demo",
+      clawhubUrl: "https://clawhub.ai",
+      clawhubPackage: "demo",
+      clawhubFamily: "code-plugin",
+      clawhubChannel: "official",
+    });
+    installPluginFromClawHubMock.mockResolvedValue({
+      ok: true,
+      pluginId: "demo",
+      targetDir: "/tmp/demo",
+      version: "1.2.4",
+      clawhub: {
+        source: "clawhub",
+        clawhubUrl: "https://clawhub.ai",
+        clawhubPackage: "demo",
+        clawhubFamily: "code-plugin",
+        clawhubChannel: "official",
+        integrity: "sha256-next",
+        resolvedAt: "2026-03-22T00:00:00.000Z",
+      },
+    });
+
+    for (const dryRun of [true, false]) {
+      installPluginFromClawHubMock.mockClear();
+
+      await updateNpmInstalledPlugins({
+        config,
+        pluginIds: ["demo"],
+        acknowledgeClawHubRisk: true,
+        onClawHubRisk,
+        ...(dryRun ? { dryRun: true } : {}),
+      });
+
+      expect(installPluginFromClawHubMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          spec: "clawhub:demo",
+          acknowledgeClawHubRisk: true,
+          ...(dryRun ? { dryRun: true } : {}),
+          ...(!dryRun ? { onClawHubRisk } : {}),
+        }),
+      );
+      if (dryRun) {
+        expect(clawHubInstallCall()?.onClawHubRisk).toBeUndefined();
+      }
+    }
+  });
+
   it("migrates legacy unscoped install keys when a scoped npm package updates", async () => {
     installPluginFromNpmSpecMock.mockResolvedValue({
       ok: true,
@@ -3005,9 +3074,12 @@ describe("syncPluginsForUpdateChannel", () => {
         clawhubPackage: "legacy-chat",
       }),
     );
+    const onClawHubRisk = vi.fn(async () => true);
 
     const result = await syncPluginsForUpdateChannel({
       channel: "stable",
+      acknowledgeClawHubRisk: true,
+      onClawHubRisk,
       externalizedBundledPluginBridges: [
         {
           bundledPluginId: "legacy-chat",
@@ -3041,6 +3113,8 @@ describe("syncPluginsForUpdateChannel", () => {
     expect(clawHubInstallCall()?.baseUrl).toBe("https://clawhub.ai");
     expect(clawHubInstallCall()?.mode).toBe("update");
     expect(clawHubInstallCall()?.expectedPluginId).toBe("legacy-chat");
+    expect(clawHubInstallCall()?.acknowledgeClawHubRisk).toBe(true);
+    expect(clawHubInstallCall()?.onClawHubRisk).toBe(onClawHubRisk);
     expect(installPluginFromNpmSpecMock).not.toHaveBeenCalled();
     expect(result.changed).toBe(true);
     expect(result.summary.switchedToClawHub).toEqual(["legacy-chat"]);

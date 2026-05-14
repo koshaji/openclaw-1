@@ -1,15 +1,13 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { confirm, isCancel } from "@clack/prompts";
+import { confirm, isCancel, text } from "@clack/prompts";
 import {
   checkShellCompletionStatus,
   ensureCompletionCacheExists,
 } from "../../commands/doctor-completion.js";
 import { doctorCommand } from "../../commands/doctor.js";
-import { createPreUpdateConfigSnapshot } from "../../config/backup-rotation.js";
 import {
   ConfigMutationConflictError,
   assertConfigWriteAllowedInCurrentMode,
@@ -19,7 +17,6 @@ import {
 } from "../../config/config.js";
 import { formatConfigIssueLines } from "../../config/issue-format.js";
 import { asResolvedSourceConfig, asRuntimeConfig } from "../../config/materialize.js";
-import { CONFIG_PATH } from "../../config/paths.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { PluginInstallRecord } from "../../config/types.plugins.js";
 import { GATEWAY_SERVICE_KIND, GATEWAY_SERVICE_MARKER } from "../../daemon/constants.js";
@@ -58,6 +55,7 @@ import {
   resolvePnpmGlobalDirFromGlobalRoot,
 } from "../../infra/update-global.js";
 import { runGatewayUpdate, type UpdateRunResult } from "../../infra/update-runner.js";
+import type { ClawHubRiskAcknowledgementRequest } from "../../plugins/clawhub.js";
 import { normalizePluginsConfig, resolveEffectiveEnableState } from "../../plugins/config-state.js";
 import {
   loadInstalledPluginIndexInstallRecords,
@@ -76,6 +74,7 @@ import { runCommandWithTimeout } from "../../process/exec.js";
 import { defaultRuntime } from "../../runtime.js";
 import { normalizeOptionalString } from "../../shared/string-coerce.js";
 import { stylePromptMessage } from "../../terminal/prompt-style.js";
+import { sanitizeTerminalText } from "../../terminal/safe-text.js";
 import { theme } from "../../terminal/theme.js";
 import { resolveUserPath } from "../../utils.js";
 import { replaceCliName, resolveCliName } from "../cli-name.js";
@@ -141,13 +140,6 @@ const POST_INSTALL_DOCTOR_SERVICE_ENV_KEYS = [
 ] as const;
 const POST_UPDATE_PLUGIN_REPAIR_GUIDANCE = "Run openclaw doctor --fix to attempt automatic repair.";
 
-async function createUpdateConfigSnapshot(): Promise<void> {
-  await createPreUpdateConfigSnapshot({
-    configPath: CONFIG_PATH,
-    fs: { writeFile: fs.writeFile, readFile: fs.readFile, existsSync },
-  });
-}
-
 const UPDATE_QUIPS = [
   "Leveled up! New skills unlocked. You're welcome.",
   "Fresh code, same lobster. Miss me?",
@@ -182,6 +174,48 @@ type MissingPluginInstallPayload = {
 };
 
 type PostUpdatePluginWarning = NonNullable<PostCorePluginUpdateResult["warnings"]>[number];
+
+function isNonBlockingClawHubTrustNotice(message: string): boolean {
+  const trimmed = message.trimStart();
+  return (
+    trimmed.startsWith("ClawHub trust warning ") ||
+    trimmed.startsWith("╭─ REVIEW RECOMMENDED - ClawHub ")
+  );
+}
+
+function resolveUpdateClawHubRiskAcknowledgementOptions(opts: UpdateCommandOptions): {
+  acknowledgeClawHubRisk?: boolean;
+  onClawHubRisk?: (request: ClawHubRiskAcknowledgementRequest) => Promise<boolean>;
+} {
+  if (opts.acknowledgeClawHubRisk) {
+    return { acknowledgeClawHubRisk: true };
+  }
+  if (opts.dryRun || opts.yes || opts.json || !process.stdin.isTTY || !process.stdout.isTTY) {
+    return {};
+  }
+  return {
+    onClawHubRisk: async (request) => {
+      const packageName = sanitizeTerminalText(request.packageName);
+      const releaseLabel = `${packageName}@${sanitizeTerminalText(request.version)}`;
+      if (request.acknowledgementKind === "type-package") {
+        const answer = await text({
+          message: stylePromptMessage(
+            `To update anyway, type the package name for "${releaseLabel}"`,
+          ),
+          placeholder: packageName,
+        });
+        return !isCancel(answer) && answer.trim() === packageName;
+      }
+      const ok = await confirm({
+        message: stylePromptMessage(
+          `Update ClawHub package "${releaseLabel}" after reviewing the warning above?`,
+        ),
+        initialValue: false,
+      });
+      return !isCancel(ok) && ok;
+    },
+  };
+}
 
 function pickUpdateQuip(): string {
   return UPDATE_QUIPS[Math.floor(Math.random() * UPDATE_QUIPS.length)] ?? "Update complete.";
@@ -310,12 +344,15 @@ function createGuidedPostUpdatePluginOutcome(outcome: PluginUpdateOutcome): {
   outcome: PluginUpdateOutcome;
   warning?: PostUpdatePluginWarning;
 } {
-  if (outcome.status !== "error" && !isDisabledAfterFailureOutcome(outcome)) {
+  if (outcome.status !== "error" && !isActionableSkippedPostUpdateOutcome(outcome)) {
     return { outcome };
   }
+  const warningReason = outcome.warning
+    ? `${outcome.warning}\n${outcome.message}`
+    : outcome.message;
   const warning = createPostUpdatePluginWarning({
     ...(outcome.pluginId && outcome.pluginId !== "unknown" ? { pluginId: outcome.pluginId } : {}),
-    reason: outcome.message,
+    reason: warningReason,
   });
   return {
     outcome: {
@@ -328,6 +365,20 @@ function createGuidedPostUpdatePluginOutcome(outcome: PluginUpdateOutcome): {
 
 function isDisabledAfterFailureOutcome(outcome: PluginUpdateOutcome): boolean {
   return outcome.status === "skipped" && outcome.message.includes("after plugin update failure");
+}
+
+function isClawHubRiskAcknowledgementSkippedOutcome(outcome: PluginUpdateOutcome): boolean {
+  return (
+    outcome.status === "skipped" &&
+    outcome.message.includes("ClawHub") &&
+    outcome.message.includes("--acknowledge-clawhub-risk")
+  );
+}
+
+function isActionableSkippedPostUpdateOutcome(outcome: PluginUpdateOutcome): boolean {
+  return (
+    isDisabledAfterFailureOutcome(outcome) || isClawHubRiskAcknowledgementSkippedOutcome(outcome)
+  );
 }
 
 /**
@@ -1035,7 +1086,6 @@ async function runPackageInstallUpdate(params: {
     postVerifyStep: async (verifiedPackageRoot) => {
       const entryPath = await resolveGatewayInstallEntrypoint(verifiedPackageRoot);
       if (entryPath) {
-        await createUpdateConfigSnapshot();
         return await runUpdateStep({
           name: `${CLI_NAME} doctor`,
           argv: [resolveNodeRunner(), entryPath, "doctor", "--non-interactive", "--fix"],
@@ -1182,13 +1232,31 @@ export async function updatePluginsAfterCoreUpdate(params: {
     return invalid.result;
   }
 
-  const pluginLogger = params.opts.json
-    ? {}
-    : {
-        info: (msg: string) => defaultRuntime.log(msg),
-        warn: (msg: string) => defaultRuntime.log(theme.warn(msg)),
-        error: (msg: string) => defaultRuntime.log(theme.error(msg)),
-      };
+  const clawHubTrustNotices = new Set<string>();
+  const recordClawHubTrustNotice = (message: string): void => {
+    if (isNonBlockingClawHubTrustNotice(message)) {
+      clawHubTrustNotices.add(message);
+    }
+  };
+  const pluginLogger = {
+    ...(params.opts.json ? { terminalLinks: false } : {}),
+    info: (msg: string) => {
+      if (!params.opts.json) {
+        defaultRuntime.log(msg);
+      }
+    },
+    warn: (msg: string) => {
+      recordClawHubTrustNotice(msg);
+      if (!params.opts.json) {
+        defaultRuntime.log(theme.warn(msg));
+      }
+    },
+    error: (msg: string) => {
+      if (!params.opts.json) {
+        defaultRuntime.log(theme.error(msg));
+      }
+    },
+  };
 
   if (!params.opts.json) {
     defaultRuntime.log("");
@@ -1196,6 +1264,9 @@ export async function updatePluginsAfterCoreUpdate(params: {
   }
 
   const warnings: PostUpdatePluginWarning[] = [];
+  const clawHubRiskAcknowledgementOptions = resolveUpdateClawHubRiskAcknowledgementOptions(
+    params.opts,
+  );
   const pluginInstallRecords =
     params.pluginInstallRecords ?? (await loadInstalledPluginIndexInstallRecords());
   const syncConfig = withPluginInstallRecords(
@@ -1209,6 +1280,7 @@ export async function updatePluginsAfterCoreUpdate(params: {
     externalizedBundledPluginBridges: await listPersistedBundledPluginLocationBridges({
       workspaceDir: params.root,
     }),
+    ...clawHubRiskAcknowledgementOptions,
     logger: pluginLogger,
   });
   for (const error of syncResult.summary.errors) {
@@ -1282,6 +1354,7 @@ export async function updatePluginsAfterCoreUpdate(params: {
       disableOnFailure: true,
       logger: pluginLogger,
       onIntegrityDrift: onPluginIntegrityDrift,
+      ...clawHubRiskAcknowledgementOptions,
     });
     pluginConfig = repairResult.config;
     pluginsChanged ||= repairResult.changed;
@@ -1302,6 +1375,7 @@ export async function updatePluginsAfterCoreUpdate(params: {
     disableOnFailure: true,
     logger: pluginLogger,
     onIntegrityDrift: onPluginIntegrityDrift,
+    ...clawHubRiskAcknowledgementOptions,
   });
   pluginConfig = npmResult.config;
   pluginsChanged ||= npmResult.changed;
@@ -1353,6 +1427,7 @@ export async function updatePluginsAfterCoreUpdate(params: {
     cfg: pluginConfig,
     env: process.env,
     baselineInstallRecords: convergenceBaselineRecords,
+    ...clawHubRiskAcknowledgementOptions,
   });
   for (const change of convergence.changes) {
     if (!params.opts.json) {
@@ -1397,6 +1472,14 @@ export async function updatePluginsAfterCoreUpdate(params: {
       workspaceDir: params.root,
       installRecords: nextInstallRecords,
       logger: pluginLogger,
+    });
+  }
+
+  for (const notice of clawHubTrustNotices) {
+    warnings.push({
+      reason: notice,
+      message: notice,
+      guidance: [],
     });
   }
 
@@ -1465,7 +1548,7 @@ export async function updatePluginsAfterCoreUpdate(params: {
   }
 
   for (const outcome of pluginUpdateOutcomes) {
-    if (outcome.status !== "error") {
+    if (outcome.status !== "error" && !isActionableSkippedPostUpdateOutcome(outcome)) {
       continue;
     }
     defaultRuntime.log(theme.warn(outcome.message));
@@ -1656,11 +1739,9 @@ async function maybeRestartService(params: {
       // that already produced the expected gateway version, a second kickstart
       // would only race the healthy supervisor-owned process.
       if (!refreshedGatewayAlreadyHealthy && params.restartScriptPath) {
-        await createUpdateConfigSnapshot();
         await runRestartScript(params.restartScriptPath);
         restartInitiated = true;
       } else if (!refreshedGatewayAlreadyHealthy && params.refreshServiceEnv && isPackageUpdate) {
-        await createUpdateConfigSnapshot();
         restarted = await runUpdatedInstallGatewayRestart({
           result: params.result,
           jsonMode: Boolean(params.opts.json),
@@ -1671,7 +1752,6 @@ async function maybeRestartService(params: {
         !refreshedGatewayAlreadyHealthy &&
         shouldUseLegacyProcessRestartAfterUpdate({ updateMode: params.result.mode })
       ) {
-        await createUpdateConfigSnapshot();
         restarted = await runDaemonRestart();
       } else if (!refreshedGatewayAlreadyHealthy && !params.opts.json) {
         defaultRuntime.log(theme.muted("No installed gateway service found; skipped restart."));
@@ -1698,7 +1778,6 @@ async function maybeRestartService(params: {
       if (!params.opts.json && restarted) {
         defaultRuntime.log(theme.success("Daemon restarted successfully."));
         defaultRuntime.log("");
-        await createUpdateConfigSnapshot();
         process.env.OPENCLAW_UPDATE_IN_PROGRESS = "1";
         process.env[UPDATE_PARENT_SUPPORTS_DOCTOR_CONFIG_WRITE_ENV] = "1";
         try {
@@ -1963,6 +2042,9 @@ async function continuePostCoreUpdateInFreshProcess(params: {
   }
   if (params.opts.yes) {
     argv.push("--yes");
+  }
+  if (params.opts.acknowledgeClawHubRisk) {
+    argv.push("--acknowledge-clawhub-risk");
   }
   if (params.opts.timeout) {
     argv.push("--timeout", params.opts.timeout);
